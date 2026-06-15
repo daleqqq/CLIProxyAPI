@@ -341,6 +341,14 @@ type RoutingConfig struct {
 	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
 	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
 	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
+
+	// WeeklyResetAware, when true, layers reset-aware ranking on top of Strategy: among
+	// available credentials it prefers the one whose weekly quota is most at risk of being
+	// wasted before its window resets (required burn-rate), falling back to Strategy for ties
+	// or credentials with no observed weekly window. Currently effective only for Claude
+	// OAuth/subscription auths (which report Anthropic unified rate-limit headers); it no-ops
+	// for Codex, API-key, and other providers, which keep their existing selection policy.
+	WeeklyResetAware bool `yaml:"weekly-reset-aware,omitempty" json:"weekly-reset-aware,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

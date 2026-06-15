@@ -384,6 +384,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		&param,
 	)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
+	if snapshot, ok := helps.ParseAnthropicUnifiedRateLimits(httpResp.Header, time.Now()); ok {
+		resp.RateLimit = &snapshot
+	}
 	return resp, nil
 }
 
@@ -611,7 +614,11 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	streamResult := &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}
+	if snapshot, ok := helps.ParseAnthropicUnifiedRateLimits(httpResp.Header, time.Now()); ok {
+		streamResult.RateLimit = &snapshot
+	}
+	return streamResult, nil
 }
 
 func validateClaudeStreamingResponse(data []byte) error {

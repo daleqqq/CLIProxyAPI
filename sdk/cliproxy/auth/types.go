@@ -174,6 +174,21 @@ type QuotaState struct {
 	NextRecoverAt time.Time `json:"next_recover_at"`
 	// BackoffLevel stores the progressive cooldown exponent used for rate limits.
 	BackoffLevel int `json:"backoff_level,omitempty"`
+
+	// WeeklyResetAt is when the provider's weekly (7d) usage window resets.
+	// Populated from provider rate-limit snapshots and used by reset-aware routing.
+	WeeklyResetAt time.Time `json:"weekly_reset_at,omitempty"`
+	// WeeklyUtilization is the fraction (0..1) of the weekly budget consumed.
+	WeeklyUtilization float64 `json:"weekly_utilization,omitempty"`
+	// FiveHourResetAt is when the provider's 5h usage window resets (observability).
+	FiveHourResetAt time.Time `json:"five_hour_reset_at,omitempty"`
+	// FiveHourUtilization is the fraction (0..1) of the 5h budget consumed (observability).
+	FiveHourUtilization float64 `json:"five_hour_utilization,omitempty"`
+	// UnifiedStatus is the provider's last reported limiter status (e.g. "allowed", "rate_limited").
+	UnifiedStatus string `json:"unified_status,omitempty"`
+	// LimitedUntil is the reset time of the representative window when the provider last
+	// reported rate_limited; selection skips the auth until this passes. Zero when not limited.
+	LimitedUntil time.Time `json:"limited_until,omitempty"`
 }
 
 // ModelState captures the execution state for a specific model under an auth entry.

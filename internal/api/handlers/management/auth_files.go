@@ -514,6 +514,26 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if !auth.NextRetryAfter.IsZero() {
 		entry["next_retry_after"] = auth.NextRetryAfter
 	}
+	// Surface observed quota-window state (e.g. Anthropic unified rate limits) used by
+	// reset-aware routing, when present.
+	if !auth.Quota.WeeklyResetAt.IsZero() {
+		entry["weekly_reset_at"] = auth.Quota.WeeklyResetAt
+	}
+	if auth.Quota.WeeklyUtilization > 0 {
+		entry["weekly_utilization"] = auth.Quota.WeeklyUtilization
+	}
+	if !auth.Quota.FiveHourResetAt.IsZero() {
+		entry["five_hour_reset_at"] = auth.Quota.FiveHourResetAt
+	}
+	if auth.Quota.FiveHourUtilization > 0 {
+		entry["five_hour_utilization"] = auth.Quota.FiveHourUtilization
+	}
+	if status := strings.TrimSpace(auth.Quota.UnifiedStatus); status != "" {
+		entry["unified_status"] = status
+	}
+	if !auth.Quota.LimitedUntil.IsZero() {
+		entry["limited_until"] = auth.Quota.LimitedUntil
+	}
 	if path != "" {
 		entry["path"] = path
 		entry["source"] = "file"

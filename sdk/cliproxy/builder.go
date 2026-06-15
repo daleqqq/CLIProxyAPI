@@ -234,10 +234,12 @@ func (b *Builder) Build() (*Service, error) {
 		strategy := ""
 		sessionAffinity := false
 		sessionAffinityTTL := time.Hour
+		weeklyResetAware := false
 		if b.cfg != nil {
 			strategy = strings.ToLower(strings.TrimSpace(b.cfg.Routing.Strategy))
 			// Support both legacy ClaudeCodeSessionAffinity and new universal SessionAffinity
 			sessionAffinity = b.cfg.Routing.SessionAffinity
+			weeklyResetAware = b.cfg.Routing.WeeklyResetAware
 			if ttlStr := strings.TrimSpace(b.cfg.Routing.SessionAffinityTTL); ttlStr != "" {
 				if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
 					sessionAffinityTTL = parsed
@@ -250,6 +252,11 @@ func (b *Builder) Build() (*Service, error) {
 			selector = &coreauth.FillFirstSelector{}
 		default:
 			selector = &coreauth.RoundRobinSelector{}
+		}
+
+		// Layer reset-aware ranking on top of the base strategy when enabled.
+		if weeklyResetAware {
+			selector = coreauth.NewResetAwareSelector(selector)
 		}
 
 		// Wrap with session affinity if enabled (failover is always on)

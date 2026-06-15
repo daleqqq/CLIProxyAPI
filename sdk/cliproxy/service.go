@@ -1255,11 +1255,13 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 	previousStrategy := ""
 	var previousSessionAffinity bool
 	var previousSessionAffinityTTL string
+	var previousWeeklyResetAware bool
 	s.cfgMu.RLock()
 	if s.cfg != nil {
 		previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
 		previousSessionAffinity = s.cfg.Routing.SessionAffinity
 		previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
+		previousWeeklyResetAware = s.cfg.Routing.WeeklyResetAware
 	}
 	s.cfgMu.RUnlock()
 
@@ -1286,10 +1288,12 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 
 	nextSessionAffinity := newCfg.Routing.SessionAffinity
 	nextSessionAffinityTTL := newCfg.Routing.SessionAffinityTTL
+	nextWeeklyResetAware := newCfg.Routing.WeeklyResetAware
 
 	selectorChanged := previousStrategy != nextStrategy ||
 		previousSessionAffinity != nextSessionAffinity ||
-		previousSessionAffinityTTL != nextSessionAffinityTTL
+		previousSessionAffinityTTL != nextSessionAffinityTTL ||
+		previousWeeklyResetAware != nextWeeklyResetAware
 
 	if s.coreManager != nil && selectorChanged {
 		var selector coreauth.Selector
@@ -1298,6 +1302,10 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 			selector = &coreauth.FillFirstSelector{}
 		default:
 			selector = &coreauth.RoundRobinSelector{}
+		}
+
+		if nextWeeklyResetAware {
+			selector = coreauth.NewResetAwareSelector(selector)
 		}
 
 		if nextSessionAffinity {

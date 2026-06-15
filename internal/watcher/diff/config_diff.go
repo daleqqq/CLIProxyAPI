@@ -109,6 +109,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Routing.Strategy != newCfg.Routing.Strategy {
 		changes = append(changes, fmt.Sprintf("routing.strategy: %s -> %s", oldCfg.Routing.Strategy, newCfg.Routing.Strategy))
 	}
+	if oldCfg.Routing.WeeklyResetAware != newCfg.Routing.WeeklyResetAware {
+		changes = append(changes, fmt.Sprintf("routing.weekly-reset-aware: %t -> %t", oldCfg.Routing.WeeklyResetAware, newCfg.Routing.WeeklyResetAware))
+	}
 	if !reflect.DeepEqual(oldCfg.Payload, newCfg.Payload) {
 		changes = appendPayloadConfigChanges(changes, oldCfg.Payload, newCfg.Payload)
 	}

@@ -170,6 +170,9 @@ type Result struct {
 	RetryAfter *time.Duration
 	// Error describes the failure when Success is false.
 	Error *Error
+	// RateLimit carries an optional rate-limit window snapshot observed from the
+	// upstream response (e.g. Anthropic unified headers), used by reset-aware routing.
+	RateLimit *cliproxyexecutor.RateLimitSnapshot
 }
 
 // Selector chooses an auth candidate for execution.
@@ -1591,7 +1594,7 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, rateLimit *cliproxyexecutor.RateLimitSnapshot, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -1634,10 +1637,10 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 			}
 		}
 		if !failed {
-			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true})
+			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true, RateLimit: rateLimit})
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
+	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out, RateLimit: rateLimit}
 }
 
 func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool) (*cliproxyexecutor.StreamResult, error) {
@@ -1728,7 +1731,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining), nil
+		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, streamResult.RateLimit, buffered, remaining), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -2374,6 +2377,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				authErr = errExec
 				continue
 			}
+			result.RateLimit = resp.RateLimit
 			m.MarkResult(execCtx, result)
 			return resp, nil
 		}
@@ -3466,6 +3470,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
+		applyRateLimitSnapshot(auth, result.RateLimit, now)
+
 		_ = m.persist(ctx, auth)
 		authSnapshot = auth.Clone()
 		if trackCooldownState {
@@ -3495,6 +3501,67 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
+}
+
+// applyRateLimitSnapshot persists an observed rate-limit window snapshot (e.g. Anthropic
+// unified headers) onto the auth's quota state for reset-aware routing, and records a
+// "limited until" marker when the provider reports it is currently rate-limited so the
+// selector can skip the auth until the representative window resets. Availability gating is
+// handled in the selector via Quota.LimitedUntil; this does not touch the cooldown/backoff
+// machinery used by the 429 failure path.
+func applyRateLimitSnapshot(auth *Auth, snapshot *cliproxyexecutor.RateLimitSnapshot, now time.Time) {
+	if auth == nil || snapshot == nil {
+		return
+	}
+	if !snapshot.WeeklyResetAt.IsZero() {
+		auth.Quota.WeeklyResetAt = snapshot.WeeklyResetAt
+	}
+	if !snapshot.FiveHourResetAt.IsZero() {
+		auth.Quota.FiveHourResetAt = snapshot.FiveHourResetAt
+	}
+	auth.Quota.WeeklyUtilization = snapshot.WeeklyUtilization
+	auth.Quota.FiveHourUtilization = snapshot.FiveHourUtilization
+	if snapshot.Status != "" {
+		auth.Quota.UnifiedStatus = snapshot.Status
+	}
+	if strings.EqualFold(snapshot.Status, "rate_limited") {
+		if reset := representativeWindowReset(snapshot); reset.After(now) {
+			auth.Quota.LimitedUntil = reset
+		}
+	} else if snapshot.Status != "" {
+		auth.Quota.LimitedUntil = time.Time{}
+	}
+}
+
+// representativeWindowReset returns the reset time of the window the provider marked as
+// authoritative (5h vs weekly). When the representative window is unknown it falls back to
+// the soonest known reset so the auth recovers no later than necessary.
+func representativeWindowReset(snapshot *cliproxyexecutor.RateLimitSnapshot) time.Time {
+	window := snapshot.RepresentativeWindow
+	switch {
+	case strings.Contains(window, "5") || strings.Contains(window, "five") || strings.Contains(window, "hour"):
+		if !snapshot.FiveHourResetAt.IsZero() {
+			return snapshot.FiveHourResetAt
+		}
+	case strings.Contains(window, "7") || strings.Contains(window, "seven") || strings.Contains(window, "day") || strings.Contains(window, "week"):
+		if !snapshot.WeeklyResetAt.IsZero() {
+			return snapshot.WeeklyResetAt
+		}
+	}
+	return soonestNonZeroTime(snapshot.FiveHourResetAt, snapshot.WeeklyResetAt)
+}
+
+func soonestNonZeroTime(a, b time.Time) time.Time {
+	switch {
+	case a.IsZero():
+		return b
+	case b.IsZero():
+		return a
+	case a.Before(b):
+		return a
+	default:
+		return b
+	}
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {
@@ -4976,6 +5043,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 				m.MarkResult(creditsCtx, result)
 				continue
 			}
+			result.RateLimit = resp.RateLimit
 			m.MarkResult(creditsCtx, result)
 			return resp, true, nil
 		}

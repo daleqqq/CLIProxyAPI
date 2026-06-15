@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"time"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
@@ -119,6 +120,28 @@ type Response struct {
 	Metadata map[string]any
 	// Headers carries upstream HTTP response headers for passthrough to clients.
 	Headers http.Header
+	// RateLimit carries an optional rate-limit window snapshot parsed from the
+	// upstream response (e.g. Anthropic unified rate-limit headers). It is nil
+	// when the provider does not report such data.
+	RateLimit *RateLimitSnapshot
+}
+
+// RateLimitSnapshot captures a provider's rate-limit window state observed from an
+// upstream response. It is currently populated from Anthropic unified rate-limit
+// headers (subscription/OAuth plans) and consumed by reset-aware credential routing.
+type RateLimitSnapshot struct {
+	// Status is the provider's overall limiter status (e.g. "allowed", "rate_limited").
+	Status string
+	// RepresentativeWindow names the authoritative window for Status (e.g. "five_hour", "seven_day").
+	RepresentativeWindow string
+	// WeeklyResetAt is when the weekly (7d) usage window resets.
+	WeeklyResetAt time.Time
+	// WeeklyUtilization is the fraction (0..1) of the weekly budget consumed.
+	WeeklyUtilization float64
+	// FiveHourResetAt is when the 5h usage window resets.
+	FiveHourResetAt time.Time
+	// FiveHourUtilization is the fraction (0..1) of the 5h budget consumed.
+	FiveHourUtilization float64
 }
 
 // StreamChunk represents a single streaming payload unit emitted by provider executors.
@@ -136,6 +159,9 @@ type StreamResult struct {
 	Headers http.Header
 	// Chunks is the channel of streaming payload units.
 	Chunks <-chan StreamChunk
+	// RateLimit carries an optional rate-limit window snapshot parsed from the
+	// initial upstream response headers. It is nil when unavailable.
+	RateLimit *RateLimitSnapshot
 }
 
 // StatusError represents an error that carries an HTTP-like status code.

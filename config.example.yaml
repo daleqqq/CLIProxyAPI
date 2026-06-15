@@ -169,6 +169,11 @@ routing:
   session-affinity: false # default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
+  # Prefer the credential whose weekly quota is most at risk of being wasted before its
+  # window resets (required burn-rate), falling back to `strategy` for ties or credentials
+  # with no observed weekly window. Currently effective only for Claude OAuth/subscription
+  # auths; no-ops for Codex, API-key, and other providers. Default: false
+  weekly-reset-aware: false
 
 # Codex provider behavior.
 codex:
