@@ -50,6 +50,53 @@ func TestParseAnthropicUnifiedRateLimits_Absent(t *testing.T) {
 	}
 }
 
+func TestParseAnthropicOAuthUsageRateLimits(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	fiveHour := now.Add(2 * time.Hour)
+	weekly := now.Add(48 * time.Hour)
+	body := []byte(`{
+		"five_hour":{"utilization":93,"resets_at":"` + fiveHour.Format(time.RFC3339) + `"},
+		"seven_day":{"utilization":0.31,"resets_at":"` + weekly.Format(time.RFC3339) + `"}
+	}`)
+
+	snap, ok := ParseAnthropicOAuthUsageRateLimits(body, now)
+	if !ok {
+		t.Fatalf("ParseAnthropicOAuthUsageRateLimits() ok = false, want true")
+	}
+	if snap.Status != "allowed" {
+		t.Fatalf("Status = %q, want allowed", snap.Status)
+	}
+	if !snap.FiveHourResetAt.Equal(fiveHour) {
+		t.Fatalf("FiveHourResetAt = %v, want %v", snap.FiveHourResetAt, fiveHour)
+	}
+	if !snap.WeeklyResetAt.Equal(weekly) {
+		t.Fatalf("WeeklyResetAt = %v, want %v", snap.WeeklyResetAt, weekly)
+	}
+	if snap.FiveHourUtilization < 0.92 || snap.FiveHourUtilization > 0.94 {
+		t.Fatalf("FiveHourUtilization = %v, want ~0.93", snap.FiveHourUtilization)
+	}
+	if snap.WeeklyUtilization < 0.30 || snap.WeeklyUtilization > 0.32 {
+		t.Fatalf("WeeklyUtilization = %v, want ~0.31", snap.WeeklyUtilization)
+	}
+}
+
+func TestParseAnthropicOAuthUsageRateLimits_RateLimited(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	fiveHour := now.Add(time.Hour)
+	body := []byte(`{"five_hour":{"utilization":100,"resets_at":"` + fiveHour.Format(time.RFC3339) + `"}}`)
+
+	snap, ok := ParseAnthropicOAuthUsageRateLimits(body, now)
+	if !ok {
+		t.Fatalf("ParseAnthropicOAuthUsageRateLimits() ok = false, want true")
+	}
+	if snap.Status != "rate_limited" {
+		t.Fatalf("Status = %q, want rate_limited", snap.Status)
+	}
+	if snap.RepresentativeWindow != "five_hour" {
+		t.Fatalf("RepresentativeWindow = %q, want five_hour", snap.RepresentativeWindow)
+	}
+}
+
 func TestParseRateLimitReset_Formats(t *testing.T) {
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 

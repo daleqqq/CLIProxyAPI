@@ -36,6 +36,15 @@ func malformedClaudeTreeSignatureForClaudeExecutorTest() string {
 	return base64.StdEncoding.EncodeToString([]byte{0x12, 0xFF, 0xFE, 0xFD})
 }
 
+func withClaudeOAuthUsageURL(t *testing.T, url string) {
+	t.Helper()
+	prev := claudeOAuthUsageURL
+	claudeOAuthUsageURL = url
+	t.Cleanup(func() {
+		claudeOAuthUsageURL = prev
+	})
+}
+
 func newClaudeHeaderTestRequest(t *testing.T, incoming http.Header) *http.Request {
 	t.Helper()
 
@@ -67,6 +76,97 @@ func assertClaudeFingerprint(t *testing.T, headers http.Header, userAgent, pkgVe
 	}
 	if got := headers.Get("X-Stainless-Arch"); got != arch {
 		t.Fatalf("X-Stainless-Arch = %q, want %q", got, arch)
+	}
+}
+
+func TestClaudeRefreshUpdatesQuotaFromOAuthUsage(t *testing.T) {
+	now := time.Now().UTC()
+	fiveHourReset := now.Add(2 * time.Hour).Truncate(time.Second)
+	weeklyReset := now.Add(48 * time.Hour).Truncate(time.Second)
+
+	var sawAuthHeader bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/oauth/usage" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		sawAuthHeader = r.Header.Get("Authorization") == "Bearer sk-ant-oat-test"
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"five_hour":{"utilization":45,"resets_at":"` + fiveHourReset.Format(time.RFC3339) + `"},
+			"seven_day":{"utilization":0.75,"resets_at":"` + weeklyReset.Format(time.RFC3339) + `"}
+		}`))
+	}))
+	defer server.Close()
+	withClaudeOAuthUsageURL(t, server.URL+"/api/oauth/usage")
+
+	auth := &cliproxyauth.Auth{
+		ID:       "claude-oauth",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"access_token":  "sk-ant-oat-test",
+			"refresh_token": "refresh-token",
+			"email":         "x@example.com",
+			"expired":       now.Add(24 * time.Hour).Format(time.RFC3339),
+		},
+	}
+	updated, err := NewClaudeExecutor(&config.Config{}).Refresh(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	if !sawAuthHeader {
+		t.Fatalf("usage request missing bearer token")
+	}
+	if updated == nil {
+		t.Fatalf("Refresh() returned nil auth")
+	}
+	if updated.Quota.UnifiedStatus != "allowed" {
+		t.Fatalf("UnifiedStatus = %q, want allowed", updated.Quota.UnifiedStatus)
+	}
+	if !updated.Quota.FiveHourResetAt.Equal(fiveHourReset) {
+		t.Fatalf("FiveHourResetAt = %v, want %v", updated.Quota.FiveHourResetAt, fiveHourReset)
+	}
+	if !updated.Quota.WeeklyResetAt.Equal(weeklyReset) {
+		t.Fatalf("WeeklyResetAt = %v, want %v", updated.Quota.WeeklyResetAt, weeklyReset)
+	}
+	if updated.Quota.FiveHourUtilization < 0.44 || updated.Quota.FiveHourUtilization > 0.46 {
+		t.Fatalf("FiveHourUtilization = %v, want ~0.45", updated.Quota.FiveHourUtilization)
+	}
+	if updated.Quota.WeeklyUtilization < 0.74 || updated.Quota.WeeklyUtilization > 0.76 {
+		t.Fatalf("WeeklyUtilization = %v, want ~0.75", updated.Quota.WeeklyUtilization)
+	}
+	if _, ok := updated.Metadata["last_quota_refresh"].(string); !ok {
+		t.Fatalf("last_quota_refresh missing from metadata: %#v", updated.Metadata)
+	}
+}
+
+func TestClaudeRefreshQuotaFailureIsNonFatal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":{"message":"temporarily unavailable"}}`, http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	withClaudeOAuthUsageURL(t, server.URL)
+
+	now := time.Now().UTC()
+	auth := &cliproxyauth.Auth{
+		ID:       "claude-oauth",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"access_token":  "sk-ant-oat-test",
+			"refresh_token": "refresh-token",
+			"email":         "x@example.com",
+			"expired":       now.Add(24 * time.Hour).Format(time.RFC3339),
+		},
+	}
+
+	updated, err := NewClaudeExecutor(&config.Config{}).Refresh(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("Refresh() error = %v, want nil for quota refresh failure", err)
+	}
+	if updated == nil {
+		t.Fatalf("Refresh() returned nil auth")
+	}
+	if _, ok := updated.Metadata["last_quota_refresh_error"].(string); !ok {
+		t.Fatalf("last_quota_refresh_error missing from metadata: %#v", updated.Metadata)
 	}
 }
 

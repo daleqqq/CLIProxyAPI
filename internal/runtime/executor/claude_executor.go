@@ -49,6 +49,10 @@ func shouldSanitizeClaudeMessagesForUpstream(baseModel string) bool {
 	return sigcompat.SignatureProviderFromModelName(baseModel) == sigcompat.SignatureProviderClaude
 }
 
+const claudeOAuthTokenRefreshLead = 4 * time.Hour
+
+var claudeOAuthUsageURL = "https://api.anthropic.com/api/oauth/usage"
+
 func sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx context.Context, body []byte, baseModel string) []byte {
 	sanitized := body
 	if shouldSanitizeClaudeMessagesForUpstream(baseModel) {
@@ -803,33 +807,212 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	if auth == nil {
 		return nil, fmt.Errorf("claude executor: auth is nil")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	now := time.Now()
 	var refreshToken string
 	if auth.Metadata != nil {
 		if v, ok := auth.Metadata["refresh_token"].(string); ok && v != "" {
 			refreshToken = v
 		}
 	}
-	if refreshToken == "" {
-		return auth, nil
-	}
-	svc := claudeauth.NewClaudeAuthWithProxyURL(e.cfg, auth.ProxyURL)
-	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
-	if err != nil {
-		return nil, err
-	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
-	auth.Metadata["access_token"] = td.AccessToken
-	if td.RefreshToken != "" {
-		auth.Metadata["refresh_token"] = td.RefreshToken
+	apiKey, _ := claudeCreds(auth)
+	if refreshToken != "" && shouldRefreshClaudeOAuthToken(auth, apiKey, now) {
+		svc := claudeauth.NewClaudeAuthWithProxyURL(e.cfg, auth.ProxyURL)
+		td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
+		if err != nil {
+			return nil, err
+		}
+		auth.Metadata["access_token"] = td.AccessToken
+		if td.RefreshToken != "" {
+			auth.Metadata["refresh_token"] = td.RefreshToken
+		}
+		auth.Metadata["email"] = td.Email
+		auth.Metadata["expired"] = td.Expire
+		auth.Metadata["type"] = "claude"
+		auth.Metadata["last_token_refresh"] = now.Format(time.RFC3339)
+		apiKey = td.AccessToken
 	}
-	auth.Metadata["email"] = td.Email
-	auth.Metadata["expired"] = td.Expire
-	auth.Metadata["type"] = "claude"
-	now := time.Now().Format(time.RFC3339)
-	auth.Metadata["last_refresh"] = now
+	if snapshot, ok, err := e.refreshClaudeOAuthQuota(ctx, auth, apiKey, now); err != nil {
+		auth.Metadata["last_quota_refresh_error"] = err.Error()
+	} else if ok {
+		applyClaudeQuotaSnapshot(auth, &snapshot, now)
+		auth.Metadata["last_quota_refresh"] = now.Format(time.RFC3339)
+		delete(auth.Metadata, "last_quota_refresh_error")
+	}
+	auth.Metadata["last_refresh"] = now.Format(time.RFC3339)
 	return auth, nil
+}
+
+func shouldRefreshClaudeOAuthToken(auth *cliproxyauth.Auth, apiKey string, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	if strings.TrimSpace(apiKey) == "" {
+		return true
+	}
+	expiry, ok := auth.ExpirationTime()
+	if !ok || expiry.IsZero() {
+		return false
+	}
+	return !expiry.After(now.Add(claudeOAuthTokenRefreshLead))
+}
+
+func (e *ClaudeExecutor) refreshClaudeOAuthQuota(ctx context.Context, auth *cliproxyauth.Auth, apiKey string, now time.Time) (cliproxyexecutor.RateLimitSnapshot, bool, error) {
+	if !isClaudeOAuthToken(apiKey) {
+		return cliproxyexecutor.RateLimitSnapshot{}, false, nil
+	}
+	url := strings.TrimSpace(claudeOAuthUsageURL)
+	if url == "" {
+		return cliproxyexecutor.RateLimitSnapshot{}, false, nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return cliproxyexecutor.RateLimitSnapshot{}, false, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+
+	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		logClaudeOAuthQuotaFetch(auth, "request_failed", 0, err.Error())
+		return cliproxyexecutor.RateLimitSnapshot{}, false, err
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Errorf("response body close error: %v", errClose)
+		}
+	}()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logClaudeOAuthQuotaFetch(auth, "read_failed", resp.StatusCode, err.Error())
+		return cliproxyexecutor.RateLimitSnapshot{}, false, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		logClaudeOAuthQuotaFetch(auth, "upstream_rejected", resp.StatusCode, helps.SummarizeErrorBody(resp.Header.Get("Content-Type"), body))
+		return cliproxyexecutor.RateLimitSnapshot{}, false, statusErr{code: resp.StatusCode, msg: string(body)}
+	}
+	if snapshot, ok := helps.ParseAnthropicOAuthUsageRateLimits(body, now); ok {
+		logClaudeOAuthQuotaSnapshot(auth, "parsed_usage_body", &snapshot)
+		return snapshot, true, nil
+	}
+	if snapshot, ok := helps.ParseAnthropicUnifiedRateLimits(resp.Header, now); ok {
+		logClaudeOAuthQuotaSnapshot(auth, "parsed_response_headers", &snapshot)
+		return snapshot, true, nil
+	}
+	logClaudeOAuthQuotaFetch(auth, "no_quota_signal", resp.StatusCode, "")
+	return cliproxyexecutor.RateLimitSnapshot{}, false, nil
+}
+
+func applyClaudeQuotaSnapshot(auth *cliproxyauth.Auth, snapshot *cliproxyexecutor.RateLimitSnapshot, now time.Time) {
+	if auth == nil || snapshot == nil {
+		return
+	}
+	if !snapshot.WeeklyResetAt.IsZero() {
+		auth.Quota.WeeklyResetAt = snapshot.WeeklyResetAt
+	}
+	if !snapshot.FiveHourResetAt.IsZero() {
+		auth.Quota.FiveHourResetAt = snapshot.FiveHourResetAt
+	}
+	auth.Quota.WeeklyUtilization = snapshot.WeeklyUtilization
+	auth.Quota.FiveHourUtilization = snapshot.FiveHourUtilization
+	if snapshot.Status != "" {
+		auth.Quota.UnifiedStatus = snapshot.Status
+	}
+	if strings.EqualFold(snapshot.Status, "rate_limited") {
+		if reset := claudeRepresentativeWindowReset(snapshot); reset.After(now) {
+			auth.Quota.LimitedUntil = reset
+		}
+	} else if snapshot.Status != "" {
+		auth.Quota.LimitedUntil = time.Time{}
+	}
+}
+
+func logClaudeOAuthQuotaFetch(auth *cliproxyauth.Auth, event string, statusCode int, message string) {
+	fields := log.Fields{
+		"component":   "claude_quota_refresh",
+		"event":       event,
+		"status_code": statusCode,
+	}
+	if auth != nil {
+		fields["auth_id"] = auth.ID
+		if auth.Label != "" {
+			fields["auth_label"] = auth.Label
+		}
+		if kind, account := auth.AccountInfo(); kind != "" || account != "" {
+			fields["account_type"] = kind
+			fields["account"] = account
+		}
+	}
+	if message != "" {
+		fields["message"] = message
+	}
+	log.WithFields(fields).Debug("claude oauth quota refresh")
+}
+
+func logClaudeOAuthQuotaSnapshot(auth *cliproxyauth.Auth, event string, snapshot *cliproxyexecutor.RateLimitSnapshot) {
+	if snapshot == nil {
+		logClaudeOAuthQuotaFetch(auth, event, 0, "empty snapshot")
+		return
+	}
+	fields := log.Fields{
+		"component":             "claude_quota_refresh",
+		"event":                 event,
+		"status":                snapshot.Status,
+		"representative_window": snapshot.RepresentativeWindow,
+		"weekly_utilization":    snapshot.WeeklyUtilization,
+		"five_hour_utilization": snapshot.FiveHourUtilization,
+	}
+	if auth != nil {
+		fields["auth_id"] = auth.ID
+		if auth.Label != "" {
+			fields["auth_label"] = auth.Label
+		}
+		if kind, account := auth.AccountInfo(); kind != "" || account != "" {
+			fields["account_type"] = kind
+			fields["account"] = account
+		}
+	}
+	if !snapshot.WeeklyResetAt.IsZero() {
+		fields["weekly_reset_at"] = snapshot.WeeklyResetAt.Format(time.RFC3339)
+	}
+	if !snapshot.FiveHourResetAt.IsZero() {
+		fields["five_hour_reset_at"] = snapshot.FiveHourResetAt.Format(time.RFC3339)
+	}
+	log.WithFields(fields).Debug("claude oauth quota refresh")
+}
+
+func claudeRepresentativeWindowReset(snapshot *cliproxyexecutor.RateLimitSnapshot) time.Time {
+	if snapshot == nil {
+		return time.Time{}
+	}
+	window := snapshot.RepresentativeWindow
+	switch {
+	case strings.Contains(window, "5") || strings.Contains(window, "five") || strings.Contains(window, "hour"):
+		if !snapshot.FiveHourResetAt.IsZero() {
+			return snapshot.FiveHourResetAt
+		}
+	case strings.Contains(window, "7") || strings.Contains(window, "seven") || strings.Contains(window, "day") || strings.Contains(window, "week"):
+		if !snapshot.WeeklyResetAt.IsZero() {
+			return snapshot.WeeklyResetAt
+		}
+	}
+	switch {
+	case snapshot.FiveHourResetAt.IsZero():
+		return snapshot.WeeklyResetAt
+	case snapshot.WeeklyResetAt.IsZero():
+		return snapshot.FiveHourResetAt
+	case snapshot.FiveHourResetAt.Before(snapshot.WeeklyResetAt):
+		return snapshot.FiveHourResetAt
+	default:
+		return snapshot.WeeklyResetAt
+	}
 }
 
 // extractAndRemoveBetas extracts the "betas" array from the body and removes it.

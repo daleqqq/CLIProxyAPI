@@ -78,12 +78,16 @@ func (s *ResetAwareSelector) Pick(ctx context.Context, provider, model string, o
 	}
 
 	if !hasKnown {
-		entry.Debugf("reset-aware: no known weekly window, using fallback | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, auths)
+		entry.Debugf("reset-aware: no known weekly window, using fallback over %d usable candidates | provider=%s model=%s", len(usable), provider, model)
+		return s.fallback.Pick(ctx, provider, model, opts, usable)
 	}
 	if len(best) == 1 {
 		entry.Debugf("reset-aware: selected %s burn_rate=%.6f | provider=%s model=%s", best[0].ID, bestRate, provider, model)
 		return best[0], nil
+	}
+	if len(best) == len(usable) {
+		entry.Debugf("reset-aware: all %d usable candidates tied at burn_rate=%.6f, using fallback | provider=%s model=%s", len(usable), bestRate, provider, model)
+		return s.fallback.Pick(ctx, provider, model, opts, usable)
 	}
 	entry.Debugf("reset-aware: %d credentials tied at burn_rate=%.6f, using fallback | provider=%s model=%s", len(best), bestRate, provider, model)
 	return s.fallback.Pick(ctx, provider, model, opts, best)

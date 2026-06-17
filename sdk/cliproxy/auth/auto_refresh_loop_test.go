@@ -111,6 +111,45 @@ func TestNextRefreshCheckAt_PreferredInterval_PicksEarliestCandidate(t *testing.
 	}
 }
 
+func TestNextRefreshCheckAt_ClaudeOAuthDefaultInterval(t *testing.T) {
+	now := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
+	auth := &Auth{
+		ID:              "claude-oauth",
+		Provider:        "claude",
+		LastRefreshedAt: now.Add(-10 * time.Minute),
+		Metadata:        map[string]any{"email": "x@example.com"},
+	}
+
+	got, ok := nextRefreshCheckAt(now, auth, 5*time.Minute)
+	if !ok {
+		t.Fatalf("nextRefreshCheckAt() ok = false, want true")
+	}
+	want := now.Add(5 * time.Minute)
+	if !got.Equal(want) {
+		t.Fatalf("nextRefreshCheckAt() = %s, want %s", got, want)
+	}
+	if should := (&Manager{}).shouldRefresh(auth, now); should {
+		t.Fatalf("shouldRefresh() = true, want false before default interval")
+	}
+
+	auth.LastRefreshedAt = now.Add(-15 * time.Minute)
+	if should := (&Manager{}).shouldRefresh(auth, now); !should {
+		t.Fatalf("shouldRefresh() = false, want true at default interval")
+	}
+}
+
+func TestNextRefreshCheckAt_ClaudeAPIKeyNoDefaultInterval(t *testing.T) {
+	now := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
+	auth := &Auth{
+		ID:         "claude-key",
+		Provider:   "claude",
+		Attributes: map[string]string{"api_key": "sk-ant-api-key"},
+	}
+	if _, ok := nextRefreshCheckAt(now, auth, 5*time.Minute); ok {
+		t.Fatalf("nextRefreshCheckAt() ok = true, want false")
+	}
+}
+
 func TestNextRefreshCheckAt_ProviderLead_Expiry(t *testing.T) {
 	now := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
 	expiry := now.Add(time.Hour)

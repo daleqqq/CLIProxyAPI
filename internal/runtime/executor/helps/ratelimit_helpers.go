@@ -7,6 +7,7 @@ import (
 	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/tidwall/gjson"
 )
 
 // Anthropic unified rate-limit header names. These are returned on subscription/OAuth
@@ -57,6 +58,101 @@ func ParseAnthropicUnifiedRateLimits(h http.Header, now time.Time) (cliproxyexec
 		snapshot.FiveHourResetAt = fiveHourReset
 	}
 	return snapshot, true
+}
+
+// ParseAnthropicOAuthUsageRateLimits extracts the same reset-aware quota signal from
+// Anthropic's OAuth usage endpoint body used by the management UI.
+func ParseAnthropicOAuthUsageRateLimits(body []byte, now time.Time) (cliproxyexecutor.RateLimitSnapshot, bool) {
+	if len(body) == 0 {
+		return cliproxyexecutor.RateLimitSnapshot{}, false
+	}
+
+	var snapshot cliproxyexecutor.RateLimitSnapshot
+	var hasAny bool
+
+	if reset, util, ok := parseAnthropicUsageWindow(body, "five_hour", now); ok {
+		snapshot.FiveHourResetAt = reset
+		snapshot.FiveHourUtilization = util
+		hasAny = true
+	}
+
+	weeklyReset, weeklyUtil, hasWeekly := parseAnthropicUsageWindow(body, "seven_day", now)
+	if !hasWeekly {
+		weeklyReset, weeklyUtil, hasWeekly = bestAnthropicWeeklyUsageWindow(body, now)
+	}
+	if hasWeekly {
+		snapshot.WeeklyResetAt = weeklyReset
+		snapshot.WeeklyUtilization = weeklyUtil
+		hasAny = true
+	}
+
+	if !hasAny {
+		return cliproxyexecutor.RateLimitSnapshot{}, false
+	}
+
+	snapshot.Status = "allowed"
+	switch {
+	case snapshot.FiveHourUtilization >= 1 && !snapshot.FiveHourResetAt.IsZero():
+		snapshot.Status = "rate_limited"
+		snapshot.RepresentativeWindow = "five_hour"
+	case snapshot.WeeklyUtilization >= 1 && !snapshot.WeeklyResetAt.IsZero():
+		snapshot.Status = "rate_limited"
+		snapshot.RepresentativeWindow = "seven_day"
+	}
+	return snapshot, true
+}
+
+func parseAnthropicUsageWindow(body []byte, key string, now time.Time) (time.Time, float64, bool) {
+	if len(body) == 0 || key == "" {
+		return time.Time{}, 0, false
+	}
+	prefix := key + "."
+	util, hasUtil := parseRateLimitFraction(gjson.GetBytes(body, prefix+"utilization").String())
+	reset, hasReset := parseRateLimitReset(firstNonEmptyGJSONString(
+		gjson.GetBytes(body, prefix+"resets_at"),
+		gjson.GetBytes(body, prefix+"reset_at"),
+	), now)
+	if !hasUtil && !hasReset {
+		return time.Time{}, 0, false
+	}
+	return reset, util, true
+}
+
+func bestAnthropicWeeklyUsageWindow(body []byte, now time.Time) (time.Time, float64, bool) {
+	keys := []string{
+		"seven_day_oauth_apps",
+		"seven_day_opus",
+		"seven_day_sonnet",
+		"seven_day_cowork",
+		"iguana_necktie",
+	}
+	var bestReset time.Time
+	var bestUtil float64
+	var ok bool
+	for _, key := range keys {
+		reset, util, hasWindow := parseAnthropicUsageWindow(body, key, now)
+		if !hasWindow {
+			continue
+		}
+		if !ok || util > bestUtil {
+			bestReset = reset
+			bestUtil = util
+			ok = true
+		}
+	}
+	return bestReset, bestUtil, ok
+}
+
+func firstNonEmptyGJSONString(values ...gjson.Result) string {
+	for _, value := range values {
+		if !value.Exists() {
+			continue
+		}
+		if s := strings.TrimSpace(value.String()); s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // parseRateLimitReset parses a reset header into an absolute time. It accepts an RFC3339

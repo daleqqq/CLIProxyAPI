@@ -5263,6 +5263,12 @@ func authPreferredInterval(a *Auth) time.Duration {
 	if d := durationFromAttributes(a.Attributes, "refresh_interval_seconds", "refreshIntervalSeconds", "refresh_interval", "refreshInterval"); d > 0 {
 		return d
 	}
+	if strings.EqualFold(strings.TrimSpace(a.Provider), "claude") {
+		accountType, _ := a.AccountInfo()
+		if strings.EqualFold(accountType, "oauth") {
+			return 15 * time.Minute
+		}
+	}
 	return 0
 }
 

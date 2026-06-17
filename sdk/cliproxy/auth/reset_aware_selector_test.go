@@ -93,6 +93,54 @@ func TestResetAwareSelector_AllUnknownFallback(t *testing.T) {
 	}
 }
 
+func TestResetAwareSelector_AllUnknownUsesRoundRobinFallback(t *testing.T) {
+	t.Parallel()
+
+	selector := NewResetAwareSelector(&RoundRobinSelector{})
+	auths := []*Auth{{ID: "b"}, {ID: "a"}}
+
+	first, err := selector.Pick(context.Background(), "claude", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() first error = %v", err)
+	}
+	second, err := selector.Pick(context.Background(), "claude", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() second error = %v", err)
+	}
+	if first == nil || second == nil {
+		t.Fatalf("Pick() returned nil auths: first=%v second=%v", first, second)
+	}
+	if first.ID != "a" || second.ID != "b" {
+		t.Fatalf("Pick() sequence = %q,%q; want a,b from round-robin fallback", first.ID, second.ID)
+	}
+}
+
+func TestResetAwareSelector_AllEqualBurnRateUsesRoundRobinFallback(t *testing.T) {
+	t.Parallel()
+
+	reset := time.Now().Add(48 * time.Hour)
+	auths := []*Auth{
+		{ID: "b", Quota: QuotaState{WeeklyResetAt: reset, WeeklyUtilization: 0.30}},
+		{ID: "a", Quota: QuotaState{WeeklyResetAt: reset, WeeklyUtilization: 0.30}},
+	}
+	selector := NewResetAwareSelector(&RoundRobinSelector{})
+
+	first, err := selector.Pick(context.Background(), "claude", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() first error = %v", err)
+	}
+	second, err := selector.Pick(context.Background(), "claude", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() second error = %v", err)
+	}
+	if first == nil || second == nil {
+		t.Fatalf("Pick() returned nil auths: first=%v second=%v", first, second)
+	}
+	if first.ID != "a" || second.ID != "b" {
+		t.Fatalf("Pick() sequence = %q,%q; want a,b from round-robin fallback", first.ID, second.ID)
+	}
+}
+
 // TestResetAwareSelector_KnownBeatsUnknown verifies a credential with a weekly window is
 // preferred over one without (which is deferred to the fallback only when no known exists).
 func TestResetAwareSelector_KnownBeatsUnknown(t *testing.T) {
