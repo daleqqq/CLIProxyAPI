@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -961,13 +962,19 @@ func logClaudeOAuthQuotaSnapshot(auth *cliproxyauth.Auth, event string, snapshot
 		logClaudeOAuthQuotaFetch(auth, event, 0, "empty snapshot")
 		return
 	}
+	now := time.Now()
+	representativeReset := claudeRepresentativeWindowReset(snapshot)
 	fields := log.Fields{
 		"component":             "claude_quota_refresh",
 		"event":                 event,
 		"status":                snapshot.Status,
 		"representative_window": snapshot.RepresentativeWindow,
 		"weekly_utilization":    snapshot.WeeklyUtilization,
+		"weekly_remaining":      claudeQuotaRemainingFraction(snapshot.WeeklyUtilization),
 		"five_hour_utilization": snapshot.FiveHourUtilization,
+		"five_hour_remaining":   claudeQuotaRemainingFraction(snapshot.FiveHourUtilization),
+		"weekly_exhausted":      snapshot.WeeklyUtilization >= 1,
+		"five_hour_exhausted":   snapshot.FiveHourUtilization >= 1,
 	}
 	if auth != nil {
 		fields["auth_id"] = auth.ID
@@ -981,11 +988,38 @@ func logClaudeOAuthQuotaSnapshot(auth *cliproxyauth.Auth, event string, snapshot
 	}
 	if !snapshot.WeeklyResetAt.IsZero() {
 		fields["weekly_reset_at"] = snapshot.WeeklyResetAt.Format(time.RFC3339)
+		fields["weekly_reset_in_seconds"] = claudeResetInSeconds(snapshot.WeeklyResetAt, now)
 	}
 	if !snapshot.FiveHourResetAt.IsZero() {
 		fields["five_hour_reset_at"] = snapshot.FiveHourResetAt.Format(time.RFC3339)
+		fields["five_hour_reset_in_seconds"] = claudeResetInSeconds(snapshot.FiveHourResetAt, now)
+	}
+	if !representativeReset.IsZero() {
+		fields["representative_reset_at"] = representativeReset.Format(time.RFC3339)
+		fields["representative_reset_in_seconds"] = claudeResetInSeconds(representativeReset, now)
 	}
 	log.WithFields(fields).Debug("claude oauth quota refresh")
+}
+
+func claudeQuotaRemainingFraction(utilization float64) float64 {
+	switch {
+	case math.IsNaN(utilization) || utilization < 0:
+		utilization = 0
+	case utilization > 1:
+		utilization = 1
+	}
+	return 1 - utilization
+}
+
+func claudeResetInSeconds(reset, now time.Time) int64 {
+	if reset.IsZero() {
+		return 0
+	}
+	seconds := int64(math.Ceil(reset.Sub(now).Seconds()))
+	if seconds < 0 {
+		return 0
+	}
+	return seconds
 }
 
 func claudeRepresentativeWindowReset(snapshot *cliproxyexecutor.RateLimitSnapshot) time.Time {

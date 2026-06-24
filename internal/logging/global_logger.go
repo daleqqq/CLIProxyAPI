@@ -30,7 +30,16 @@ var (
 type LogFormatter struct{}
 
 // logFieldOrder defines the display order for common log fields.
-var logFieldOrder = []string{"provider", "model", "version", "mode", "budget", "level", "original_mode", "original_value", "min", "max", "clamped_to", "error"}
+var logFieldOrder = []string{
+	"provider", "model", "auth_id", "auth_label",
+	"weekly_reset_at", "weekly_reset_in_seconds", "weekly_utilization", "weekly_remaining", "weekly_exhausted",
+	"five_hour_reset_at", "five_hour_reset_in_seconds", "five_hour_utilization", "five_hour_remaining", "five_hour_exhausted",
+	"limited_until", "limited_in_seconds", "currently_limited", "quota_status",
+	"representative_window", "representative_reset_at", "representative_reset_in_seconds",
+	"candidate_auth_ids", "candidate_weekly_reset_at", "candidate_weekly_utilization", "candidate_five_hour_reset_at", "candidate_five_hour_utilization", "candidate_currently_limited",
+	"available_count", "usable_count", "limited_count", "fallback_strategy", "tie_count", "tied_auth_ids", "tied_five_hour_reset_at", "tied_five_hour_utilization",
+	"version", "mode", "budget", "level", "original_mode", "original_value", "min", "max", "clamped_to", "error",
+}
 
 // Format renders a single log entry with custom formatting.
 func (m *LogFormatter) Format(entry *log.Entry) ([]byte, error) {

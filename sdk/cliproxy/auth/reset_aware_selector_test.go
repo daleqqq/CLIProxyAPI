@@ -31,25 +31,93 @@ func pickResetAware(t *testing.T, fallback Selector, auths []*Auth) *Auth {
 	return got
 }
 
-// TestResetAwareSelector_HighestBurnRateWins verifies the burn-rate metric beats a
-// timing-only heuristic: an account with a large remaining budget resetting slightly later
-// outranks one with little left that resets sooner.
-func TestResetAwareSelector_HighestBurnRateWins(t *testing.T) {
+// TestResetAwareSelector_SoonestWeeklyResetWins verifies the selector prefers the account
+// whose weekly window resets soonest, even when another account has more remaining quota.
+func TestResetAwareSelector_SoonestWeeklyResetWins(t *testing.T) {
 	t.Parallel()
 
-	// P: 8% remaining (0.92 used), resets in 1 day  -> burn-rate ~0.08/day
-	// Q: 85% remaining (0.15 used), resets in 3 days -> burn-rate ~0.28/day
-	p := weeklyAuth("p", 24*time.Hour, 0.92)
-	q := weeklyAuth("q", 72*time.Hour, 0.15)
+	soon := weeklyAuth("soon", 24*time.Hour, 0.92)
+	later := weeklyAuth("later", 72*time.Hour, 0.15)
 
-	got := pickResetAware(t, &FillFirstSelector{}, []*Auth{p, q})
-	if got.ID != "q" {
-		t.Fatalf("Pick() = %q, want %q (higher burn-rate)", got.ID, "q")
+	got := pickResetAware(t, &FillFirstSelector{}, []*Auth{soon, later})
+	if got.ID != "soon" {
+		t.Fatalf("Pick() = %q, want %q (soonest weekly reset)", got.ID, "soon")
 	}
 }
 
-// TestResetAwareSelector_ABCScenario reproduces the grilled A/B/C scenario where the
-// soonest-resetting account also has the highest burn-rate.
+func TestManagerPickNextUsesResetAwareSelector(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	model := "claude-reset-aware-manager-test"
+	manager := NewManager(nil, NewResetAwareSelector(&FillFirstSelector{}), nil)
+	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "claude"})
+	if manager.useSchedulerFastPath() {
+		t.Fatalf("reset-aware selector should use legacy selector path, not scheduler fast path")
+	}
+
+	soonReset := weeklyAuth("manager-soon-reset", 24*time.Hour, 0.92)
+	soonReset.Provider = "claude"
+	laterReset := weeklyAuth("manager-later-reset", 72*time.Hour, 0.15)
+	laterReset.Provider = "claude"
+	registerSchedulerModels(t, "claude", model, soonReset.ID, laterReset.ID)
+
+	if _, err := manager.Register(ctx, soonReset); err != nil {
+		t.Fatalf("register soonReset auth: %v", err)
+	}
+	if _, err := manager.Register(ctx, laterReset); err != nil {
+		t.Fatalf("register laterReset auth: %v", err)
+	}
+
+	got, _, err := manager.pickNext(ctx, "claude", model, cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickNext() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("pickNext() auth = nil")
+	}
+	if got.ID != soonReset.ID {
+		t.Fatalf("pickNext() = %q, want %q from reset-aware soonest weekly reset ranking", got.ID, soonReset.ID)
+	}
+}
+
+func TestManagerPickNextResetAwareConsidersLowerPriorityQuota(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	model := "claude-reset-aware-priority-test"
+	manager := NewManager(nil, NewResetAwareSelector(&FillFirstSelector{}), nil)
+	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "claude"})
+
+	exhaustedHighPriority := weeklyAuth("manager-exhausted-high-priority", 24*time.Hour, 1)
+	exhaustedHighPriority.Provider = "claude"
+	exhaustedHighPriority.Attributes = map[string]string{"priority": "10"}
+	usableLowerPriority := weeklyAuth("manager-usable-lower-priority", 72*time.Hour, 0.18)
+	usableLowerPriority.Provider = "claude"
+	usableLowerPriority.Attributes = map[string]string{"priority": "0"}
+	registerSchedulerModels(t, "claude", model, exhaustedHighPriority.ID, usableLowerPriority.ID)
+
+	if _, err := manager.Register(ctx, exhaustedHighPriority); err != nil {
+		t.Fatalf("register exhaustedHighPriority auth: %v", err)
+	}
+	if _, err := manager.Register(ctx, usableLowerPriority); err != nil {
+		t.Fatalf("register usableLowerPriority auth: %v", err)
+	}
+
+	got, _, err := manager.pickNext(ctx, "claude", model, cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickNext() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("pickNext() auth = nil")
+	}
+	if got.ID != usableLowerPriority.ID {
+		t.Fatalf("pickNext() = %q, want %q from lower-priority account with weekly quota", got.ID, usableLowerPriority.ID)
+	}
+}
+
+// TestResetAwareSelector_ABCScenario verifies the soonest-resetting account wins among
+// accounts with remaining weekly quota.
 func TestResetAwareSelector_ABCScenario(t *testing.T) {
 	t.Parallel()
 
@@ -63,13 +131,12 @@ func TestResetAwareSelector_ABCScenario(t *testing.T) {
 	}
 }
 
-// TestResetAwareSelector_TieDelegatesToFallback verifies equal burn-rates defer to the
-// wrapped strategy.
+// TestResetAwareSelector_TieDelegatesToFallback verifies equal weekly reset times defer to
+// the wrapped strategy.
 func TestResetAwareSelector_TieDelegatesToFallback(t *testing.T) {
 	t.Parallel()
 
-	// Identical reset + utilization yields an exact burn-rate tie. Use a shared timestamp
-	// so the two auths are truly equal (separate time.Now() calls would differ slightly).
+	// Use a shared timestamp so the two auths have exactly equal reset times.
 	reset := time.Now().Add(48 * time.Hour)
 	a := &Auth{ID: "b", Quota: QuotaState{WeeklyResetAt: reset, WeeklyUtilization: 0.30}}
 	b := &Auth{ID: "a", Quota: QuotaState{WeeklyResetAt: reset, WeeklyUtilization: 0.30}}
@@ -115,7 +182,7 @@ func TestResetAwareSelector_AllUnknownUsesRoundRobinFallback(t *testing.T) {
 	}
 }
 
-func TestResetAwareSelector_AllEqualBurnRateUsesRoundRobinFallback(t *testing.T) {
+func TestResetAwareSelector_AllEqualWeeklyResetUsesRoundRobinFallback(t *testing.T) {
 	t.Parallel()
 
 	reset := time.Now().Add(48 * time.Hour)
@@ -141,8 +208,9 @@ func TestResetAwareSelector_AllEqualBurnRateUsesRoundRobinFallback(t *testing.T)
 	}
 }
 
-// TestResetAwareSelector_KnownBeatsUnknown verifies a credential with a weekly window is
-// preferred over one without (which is deferred to the fallback only when no known exists).
+// TestResetAwareSelector_KnownBeatsUnknown verifies a credential with usable weekly quota is
+// preferred over one without a weekly window (which is deferred to the fallback only when no
+// known eligible window exists).
 func TestResetAwareSelector_KnownBeatsUnknown(t *testing.T) {
 	t.Parallel()
 
@@ -155,12 +223,24 @@ func TestResetAwareSelector_KnownBeatsUnknown(t *testing.T) {
 	}
 }
 
+func TestResetAwareSelector_SkipsExhaustedWeeklyQuota(t *testing.T) {
+	t.Parallel()
+
+	exhausted := weeklyAuth("exhausted", 24*time.Hour, 1.0)
+	open := weeklyAuth("open", 72*time.Hour, 0.99)
+
+	got := pickResetAware(t, &FillFirstSelector{}, []*Auth{exhausted, open})
+	if got.ID != "open" {
+		t.Fatalf("Pick() = %q, want %q (weekly quota remaining)", got.ID, "open")
+	}
+}
+
 // TestResetAwareSelector_SkipsLimitedUntil verifies an account whose representative window
 // is currently rate-limited is skipped in favour of the next-best usable account.
 func TestResetAwareSelector_SkipsLimitedUntil(t *testing.T) {
 	t.Parallel()
 
-	// "capped" has the highest burn-rate but is rate-limited until later.
+	// "capped" has the soonest weekly reset but is rate-limited until later.
 	capped := weeklyAuth("capped", 24*time.Hour, 0.10)
 	capped.Quota.UnifiedStatus = "rate_limited"
 	capped.Quota.LimitedUntil = time.Now().Add(2 * time.Hour)
@@ -184,7 +264,7 @@ func TestResetAwareSelector_AllLimitedFallsThrough(t *testing.T) {
 		a.Quota.LimitedUntil = time.Now().Add(time.Hour)
 		return a
 	}
-	// Even all-limited, the highest burn-rate among them should be chosen.
+	// Even all-limited, the soonest weekly reset among them should be chosen.
 	low := mk("low", 144*time.Hour, 0.10)
 	high := mk("high", 24*time.Hour, 0.10)
 
@@ -194,21 +274,21 @@ func TestResetAwareSelector_AllLimitedFallsThrough(t *testing.T) {
 	}
 }
 
-// TestResetAwareSelector_PriorityBucket verifies reset-aware ranking only operates within
-// the highest available priority bucket.
-func TestResetAwareSelector_PriorityBucket(t *testing.T) {
+// TestResetAwareSelector_WeeklyQuotaBeatsPriority verifies reset-aware ranking can select
+// a lower-priority account when the higher-priority account has no weekly quota remaining.
+func TestResetAwareSelector_WeeklyQuotaBeatsPriority(t *testing.T) {
 	t.Parallel()
 
-	// High priority but low burn-rate.
-	hiPri := weeklyAuth("hi", 144*time.Hour, 0.10)
+	// High priority, but weekly quota is exhausted.
+	hiPri := weeklyAuth("hi", 24*time.Hour, 1)
 	hiPri.Attributes = map[string]string{"priority": "10"}
-	// Low priority but very high burn-rate (should still lose: filtered out by priority).
-	loPri := weeklyAuth("lo", 1*time.Hour, 0.10)
+	// Low priority, but it still has weekly quota.
+	loPri := weeklyAuth("lo", 144*time.Hour, 0.10)
 	loPri.Attributes = map[string]string{"priority": "0"}
 
 	got := pickResetAware(t, &FillFirstSelector{}, []*Auth{loPri, hiPri})
-	if got.ID != "hi" {
-		t.Fatalf("Pick() = %q, want %q (priority bucket wins before burn-rate)", got.ID, "hi")
+	if got.ID != "lo" {
+		t.Fatalf("Pick() = %q, want %q (weekly quota beats priority)", got.ID, "lo")
 	}
 }
 
@@ -216,7 +296,7 @@ func TestResetAwareSelector_PriorityBucket(t *testing.T) {
 func TestResetAwareSelector_ExcludesCooledAuth(t *testing.T) {
 	t.Parallel()
 
-	cooled := weeklyAuth("cooled", 24*time.Hour, 0.10) // best burn-rate, but cooled
+	cooled := weeklyAuth("cooled", 24*time.Hour, 0.10) // soonest reset, but cooled
 	cooled.Unavailable = true
 	cooled.NextRetryAfter = time.Now().Add(time.Hour)
 	cooled.Quota.Exceeded = true
@@ -229,28 +309,28 @@ func TestResetAwareSelector_ExcludesCooledAuth(t *testing.T) {
 	}
 }
 
-func TestWeeklyBurnRate_RollForwardStaleReset(t *testing.T) {
+func TestEffectiveWeeklyResetWithQuota_RollForwardStaleReset(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
 	// Reset 3 days in the past should roll forward to ~4 days in the future (7d window).
 	auth := &Auth{Quota: QuotaState{WeeklyResetAt: now.Add(-3 * 24 * time.Hour), WeeklyUtilization: 0.5}}
-	rate, ok := weeklyBurnRate(auth, now)
+	reset, ok := effectiveWeeklyResetWithQuota(auth, now)
 	if !ok {
-		t.Fatalf("weeklyBurnRate() ok = false, want true (stale reset should roll forward)")
+		t.Fatalf("effectiveWeeklyResetWithQuota() ok = false, want true (stale reset should roll forward)")
 	}
-	if rate <= 0 {
-		t.Fatalf("weeklyBurnRate() = %v, want > 0", rate)
+	if !reset.After(now) {
+		t.Fatalf("effectiveWeeklyResetWithQuota() reset = %v, want after %v", reset, now)
 	}
 }
 
-func TestWeeklyBurnRate_Unknown(t *testing.T) {
+func TestEffectiveWeeklyResetWithQuota_Unknown(t *testing.T) {
 	t.Parallel()
 
-	if _, ok := weeklyBurnRate(&Auth{}, time.Now()); ok {
-		t.Fatalf("weeklyBurnRate() ok = true for zero reset, want false")
+	if _, ok := effectiveWeeklyResetWithQuota(&Auth{}, time.Now()); ok {
+		t.Fatalf("effectiveWeeklyResetWithQuota() ok = true for zero reset, want false")
 	}
-	if _, ok := weeklyBurnRate(nil, time.Now()); ok {
-		t.Fatalf("weeklyBurnRate(nil) ok = true, want false")
+	if _, ok := effectiveWeeklyResetWithQuota(nil, time.Now()); ok {
+		t.Fatalf("effectiveWeeklyResetWithQuota(nil) ok = true, want false")
 	}
 }

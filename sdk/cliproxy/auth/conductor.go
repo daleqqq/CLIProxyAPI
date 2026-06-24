@@ -4233,6 +4233,10 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		return nil, nil, errAvailable
 	}
 	available = cloneAuthSlice(available)
+	selectorAvailable := available
+	if selectorUsesResetAwareRanking(selector) {
+		selectorAvailable = cloneAuthSlice(candidates)
+	}
 	m.mu.RUnlock()
 
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
@@ -4240,7 +4244,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		return nil, nil, errPick
 	}
 	if !handled {
-		selected, errPick = selector.Pick(ctx, provider, selectionArgForSelector(selector, model), opts, available)
+		selected, errPick = selector.Pick(ctx, provider, selectionArgForSelector(selector, model), opts, selectorAvailable)
 		if errPick != nil {
 			return nil, nil, errPick
 		}
@@ -4393,6 +4397,10 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		return nil, nil, "", errAvailable
 	}
 	available = cloneAuthSlice(available)
+	selectorAvailable := available
+	if selectorUsesResetAwareRanking(selector) {
+		selectorAvailable = cloneAuthSlice(candidates)
+	}
 	m.mu.RUnlock()
 
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
@@ -4400,7 +4408,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		return nil, nil, "", errPick
 	}
 	if !handled {
-		selected, errPick = selector.Pick(ctx, "mixed", selectionArgForSelector(selector, model), opts, available)
+		selected, errPick = selector.Pick(ctx, "mixed", selectionArgForSelector(selector, model), opts, selectorAvailable)
 		if errPick != nil {
 			return nil, nil, "", errPick
 		}
